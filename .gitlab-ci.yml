@@ -1,0 +1,106 @@
+stages:
+  - build
+  - test
+  - deploy
+
+variables:
+  DOCKER_HOST: "unix:///var/run/docker.sock" # или "tcp://localhost:2375"
+  DOCKER_TLS_CERTDIR: ""
+  SERVICE_NAME: "lead-service"
+  DOCKER_COMPOSE_FILE: "docker-compose.yml"
+
+services:
+  - name: docker:24.0-dind
+    alias: docker
+    command: ["--tls=false", "--host=unix:///var/run/docker.sock"]
+
+build:
+  stage: build
+  image: docker:24.0
+  script:
+    - docker-compose build
+    - |
+      if [ "$CI_COMMIT_BRANCH" = "main" ] || [ "$CI_COMMIT_BRANCH" = "master" ]; then
+        echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+        docker-compose push
+      else
+        echo "Skipping docker-compose push: not on main/master branch"
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master" || $CI_PIPELINE_SOURCE == "merge_request_event"'
+
+test:
+  stage: test
+  image: php:8.2-fpm
+  services:
+    - mysql:8.0
+    - redis:alpine
+  variables:
+    DB_HOST: mysql
+    DB_PORT: 3306
+    DB_DATABASE: testing
+    DB_USERNAME: root
+    DB_PASSWORD: ""
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+  before_script:
+    - cd src
+    - apt update && apt install -y unzip git curl libzip-dev libpng-dev libonig-dev libxml2-dev
+    - docker-php-ext-install pdo_mysql zip
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - |
+      cat <<EOF > .env
+      APP_NAME=Laravel
+      APP_ENV=testing
+      APP_KEY=
+      APP_DEBUG=true
+
+      LOG_CHANNEL=stack
+      DB_CONNECTION=mysql
+      DB_HOST=${DB_HOST}
+      DB_PORT=${DB_PORT}
+      DB_DATABASE=${DB_DATABASE}
+      DB_USERNAME=${DB_USERNAME}
+      DB_PASSWORD=${DB_PASSWORD}
+
+      REDIS_HOST=${REDIS_HOST}
+      REDIS_PORT=${REDIS_PORT}
+      EOF
+    - composer install --no-interaction
+    - php artisan key:generate
+    - php artisan migrate --seed
+    - php artisan jwt:secret --force
+  script:
+    - php artisan test
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+deploy:
+  stage: deploy
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache openssh-client netcat-openbsd
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY_BASE64" | base64 -d > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan "$SERVER_IP" >> ~/.ssh/known_hosts
+    - SSH_USER=$(echo "$SSH_USER_BASE64" | base64 -d)
+    - export SSH_USER
+  script:
+    - ssh $SSH_USER@$SERVER_IP "cd ~/crm/$SERVICE_NAME && git pull"
+    - ssh $SSH_USER@$SERVER_IP "cd ~/crm/$SERVICE_NAME && docker-compose down && docker-compose pull && docker-compose up -d"
+    - ssh $SSH_USER@$SERVER_IP "cd ~/crm/$SERVICE_NAME && docker-compose exec -T $SERVICE_NAME php artisan migrate --no-interaction --force"
+    - ssh $SSH_USER@$SERVER_IP "cd ~/crm/$SERVICE_NAME && docker-compose exec -T $SERVICE_NAME php artisan l5-swagger:generate"
+    - ssh $SSH_USER@$SERVER_IP "chmod +x ~/crm/$SERVICE_NAME/scripts/restore_dumps.sh && cd ~/crm/$SERVICE_NAME && ./scripts/restore_dumps.sh"
+    - ssh $SSH_USER@$SERVER_IP "docker system prune -f"
+  environment:
+    name: production
+    url: https://$SERVICE_NAME.yourdomain.com
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+
+include:
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
